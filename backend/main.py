@@ -1,16 +1,13 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Body
 from fastapi.middleware.cors import CORSMiddleware
-import shutil
-import os
-from backend.saliency_engine import generate_attention_data
-import cv2
 from fastapi.staticfiles import StaticFiles
-
-# ... after app = FastAPI() ...
+import os, shutil
+import cv2
+from backend.saliency_engine import generate_attention_data, calculate_element_score
 
 app = FastAPI()
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-# Allow the frontend to talk to the backend
+
+# Enable CORS for frontend communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,6 +17,10 @@ app.add_middleware(
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
+# Cache to store the saliency map for ROI (Region of Interest) calculations
+saliency_cache = {}
 
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
@@ -27,39 +28,47 @@ async def analyze_image(file: UploadFile = File(...)):
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    # Updated return values
-    heatmap, first_focus, score, suggestions = generate_attention_data(file_path)
+    # Get results from engine, including the raw saliency_map for caching
+    # Returns: heatmap, maxLoc, quality_score, suggestions, element_scores, saliency_map
+    heatmap, first_focus, score, suggestions, element_scores, raw_saliency = generate_attention_data(file_path)
     
-    heatmap_path = os.path.join(UPLOAD_DIR, f"heatmap_{file.filename}")
+    # Store the saliency map in the cache linked to a "latest" key 
+    saliency_cache["latest"] = raw_saliency
+    
+    # Save the heatmap image to disk
+    heatmap_name = f"heatmap_{file.filename}"
+    heatmap_path = os.path.join(UPLOAD_DIR, heatmap_name)
     cv2.imwrite(heatmap_path, heatmap)
     
     return {
         "score": score,
         "first_focus": {"x": first_focus[0], "y": first_focus[1]},
         "heatmap_url": f"http://127.0.0.1:8000/{heatmap_path}",
-        "suggestions": suggestions # New field!
-    }
-@app.post("/compare")
-async def compare_designs(fileA: UploadFile = File(...), fileB: UploadFile = File(...)):
-    # 1. Process Image A
-    pathA = os.path.join(UPLOAD_DIR, fileA.filename)
-    with open(pathA, "wb") as f: shutil.copyfileobj(fileA.file, f)
-    hA, fA, sA, sugA = generate_attention_data(pathA)
-    
-    # 2. Process Image B
-    pathB = os.path.join(UPLOAD_DIR, fileB.filename)
-    with open(pathB, "wb") as f: shutil.copyfileobj(fileB.file, f)
-    hB, fB, sB, sugB = generate_attention_data(pathB)
-    
-    # 3. Determine Winner
-    winner = "Design A" if sA > sB else "Design B"
-    
-    return {
-        "designA": {"score": sA, "heatmap": f"http://127.0.0.1:8000/uploads/heatmap_{fileA.filename}"},
-        "designB": {"score": sB, "heatmap": f"http://127.0.0.1:8000/uploads/heatmap_{fileB.filename}"},
-        "recommendation": winner
+        "suggestions": suggestions,
+        "element_scores": element_scores
     }
 
-@app.get("/")
-def read_root():
-    return {"status": "AI Attention API is running"}
+@app.post("/analyze-element")
+async def analyze_specific_element(data: dict = Body(...)):
+    """
+    Receives x, y, w, h from the frontend (0-100 normalized) 
+    and returns the attention score, smart label, and AI advice.
+    """
+    if "latest" not in saliency_cache:
+        return {"error": "No image analyzed yet. Please upload an image first."}
+    
+    raw_saliency = saliency_cache["latest"]
+    h, w = raw_saliency.shape
+    
+    # Unpack the 3 values returned by the updated engine
+    element_score, label, advice = calculate_element_score(
+        raw_saliency, 
+        data['x'], data['y'], data['w'], data['h'], 
+        w, h
+    )
+    
+    return {
+        "element_score": element_score,
+        "label": label,
+        "advice": advice
+    }
